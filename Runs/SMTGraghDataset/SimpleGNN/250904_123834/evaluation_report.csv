@@ -1,0 +1,27 @@
+Metric,Value,Description
+MAE,31.679651644621114,平均绝对误差 - 所有预测的平均绝对偏差（实际时间，秒）
+MSE,19860.477756307413,均方误差 - 所有预测的均方偏差（实际时间，秒²）
+ACC,1.0,求解器选择准确率 - 正确选择最佳求解器的比例
+Actual_Time,111226.91783717183,实际总时间 - 使用预测最佳求解器的总时间（秒）
+VBS_Time,98747.45945361165,虚拟最佳求解器总时间 - 理论最优情况下的总时间（秒）
+Average_Cost,2.958619815922281,平均额外成本 - 相比虚拟最佳求解器的平均额外时间（秒）
+Segment_1_Count,3726,第1段benchmark数量
+Segment_1_ACC,1.0,第1段求解器选择准确率
+Segment_1_Average_Cost,0.2560511952245101,第1段平均额外成本（秒）
+Segment_1_Time_Range,"[1.009, 5.564]",第1段时间范围（秒）
+Segment_2_Count,231,第2段benchmark数量
+Segment_2_ACC,1.0,第2段求解器选择准确率
+Segment_2_Average_Cost,12.416896446442708,第2段平均额外成本（秒）
+Segment_2_Time_Range,"[5.564, 30.673]",第2段时间范围（秒）
+Segment_3_Count,128,第3段benchmark数量
+Segment_3_ACC,1.0,第3段求解器选择准确率
+Segment_3_Average_Cost,53.111072182655334,第3段平均额外成本（秒）
+Segment_3_Time_Range,"[30.673, 169.094]",第3段时间范围（秒）
+Segment_4_Count,4217,第4段benchmark数量
+Segment_4_ACC,1.0,第4段求解器选择准确率
+Segment_4_Average_Cost,2.9593214094285467,第4段平均额外成本（秒）
+Segment_4_Time_Range,"[169.094, 932.188]",第4段时间范围（秒）
+Top_3_ACC,1.0,Top-3准确率 - 最佳求解器在预测前3名中的比例
+Top_5_ACC,1.0,Top-5准确率 - 最佳求解器在预测前5名中的比例
+Kendall_Tau,0.00584795321637427,Kendall相关系数 - 预测排序与真实排序的相关性
+Relative_Error,0.7524238102227363,相对误差 - 预测误差相对于真实值的比例

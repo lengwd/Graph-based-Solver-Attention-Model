@@ -386,11 +386,15 @@ def evaluate_model(model_path: str, data_dir: str, output_dir: str):
     # 加载测试数据
     from DynamicConfig import DynamicConfig
     dataset_cfg = DynamicConfig(SMTGraghDataset,
-                            data_dir=data_dir,
-                            batch_size=8,
-                            drop_last=False,
-                            shuffle=False,  # 评估时不需要shuffle
-                            set_name="test")
+                                data_dir=data_dir,
+                                batch_size=16,  # 增加批次大小
+                                drop_last=False,
+                                shuffle=False,
+                                max_files_in_memory=5,  # 增加文件缓存
+                                preload_files=True)
+    dataset_cfg.set_name = "all"
+    
+    
     test_dataset = dataset_cfg.build()
 
     # 创建评估器

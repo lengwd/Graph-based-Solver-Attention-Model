@@ -3,183 +3,196 @@ from .BaseDataset import BaseDataset
 from .DatasetUtils import * 
 from typing import *
 from torch_geometric.data import Batch
-
 import os
+import gc
+import psutil
 from datetime import datetime
-
-
+import threading
+from collections import OrderedDict
 
 class SMTGraghDataset(BaseDataset):
     def __init__(self,
                  data_dir,
-                 set_name: Literal["train", "eval", "test", "debug"],
+                 set_name: Literal["all", "train", "eval", "test", "debug"],
                  batch_size: int,
                  drop_last: bool = False,
                  shuffle: bool = False,
+                 max_files_in_memory: int = 3,  # 同时在内存中保持的文件数
+                 preload_files: bool = True,    # 是否预加载文件
                  ):
         
         super().__init__(batch_size, drop_last, shuffle)
 
-        self.set_name = set_name  # 记录数据集类型
-        # self.device = DEVICE      # 记录设备（CPU/GPU）
-        self.graph_list = []    
-
-        # 1. 从文件加载所有.pt格式的数据
-        self._load_data(data_dir)
+        self.set_name = set_name
+        self.max_files_in_memory = max_files_in_memory
+        self.preload_files = preload_files
         
-        # 2. 根据set_name划分数据集（类似MNIST的处理逻辑）
+        # 文件级缓存
+        self.file_cache = OrderedDict()  # {file_idx: data_list}
+        self.file_access_count = {}      # 文件访问计数
+        
+        # 索引信息
+        self.file_paths = []
+        self.file_sample_counts = []
+        self.sample_to_file_map = []
+        
+        # 构建索引
+        self._build_file_index(data_dir)
         self._split_dataset()
         
-        # # 3. 将数据迁移到指定设备
-        # self._move_to_device()
+        # 预加载最常用的文件
+        if self.preload_files:
+            self._preload_frequent_files()
 
-
-    def _load_data(self, data_dir: List[str]):
-        """从指定目录列表加载所有.pt文件中的图数据"""
-        # 确保data_dir是列表格式
+    def _build_file_index(self, data_dir):
+        """快速构建文件索引"""
         if isinstance(data_dir, str):
             data_dir = [data_dir]
         
-        # 遍历每个数据目录
+        total_samples = 0
+        
         for dir_path in data_dir:
             if not os.path.exists(dir_path):
-                print(f"警告: 数据目录不存在，跳过: {dir_path}")
                 continue
             
-            print(f"正在加载目录: {dir_path}")
-            dir_loaded_count = 0
+            print(f"正在扫描目录: {dir_path}")
             
-            # 遍历目录下所有.pt文件
-            for file_name in os.listdir(dir_path):
-                if file_name.endswith(".pt"):  # 确保只处理.pt文件
+            for file_name in sorted(os.listdir(dir_path)):  # 排序确保一致性
+                if file_name.endswith(".pt"):
                     file_path = os.path.join(dir_path, file_name)
                     try:
-                        # 加载文件中的数据（假设每个文件存储一个图数据列表）
-                        data_list = torch.load(file_path, weights_only=False)
-                        # 扩展到总列表中（确保data_list是可迭代的图数据）
-                        self.graph_list.extend(data_list)
-                        dir_loaded_count += len(data_list)
-                        print(f"  成功加载 {file_name}，新增 {len(data_list)} 个图数据")
+                        # 快速获取样本数量
+                        sample_count = self._get_file_sample_count_fast(file_path)
+                        
+                        self.file_paths.append(file_path)
+                        self.file_sample_counts.append(sample_count)
+                        
+                        # 建立样本到文件的映射
+                        for i in range(sample_count):
+                            self.sample_to_file_map.append((len(self.file_paths) - 1, i))
+                        
+                        total_samples += sample_count
+                        print(f"  扫描 {file_name}，包含 {sample_count} 个样本")
+                        
                     except Exception as e:
-                        print(f"  加载 {file_name} 失败: {str(e)}")
-            
-            print(f"目录 {dir_path} 加载完成，共加载 {dir_loaded_count} 个图数据")
+                        print(f"  扫描 {file_name} 失败: {str(e)}")
         
-        # 检查是否加载到数据
-        if not self.graph_list:
-            raise RuntimeError(f"在所有指定目录中未找到有效数据: {data_dir}")
-        
-        print("数据集结构", self.graph_list[0], self.graph_list[0].y.item())
-        
-        # 初始化总样本数
-        self.n_samples = len(self.graph_list)
-        print(f"数据加载完成，共 {self.n_samples} 个图数据")
+        self.n_samples = total_samples
+        print(f"文件扫描完成，共发现 {self.n_samples} 个样本")
+
+    def _get_file_sample_count_fast(self, file_path: str) -> int:
+        """快速获取文件样本数量"""
+        try:
+            # 使用 map_location='cpu' 避免GPU内存占用
+            data = torch.load(file_path, map_location='cpu', weights_only=False)
+            count = len(data) if isinstance(data, list) else 1
+            del data
+            return count
+        except:
+            return 0
 
     def _split_dataset(self):
-        """根据set_name划分数据集"""
-        # 记录原始数据长度，用于划分
+        """数据集划分"""
         original_len = self.n_samples
         
         match self.set_name:
+            case "all":
+                self.sample_indices = list(range(0, original_len))
             case "train":
-                # 取前90%作为训练集
-                self.n_samples = int(original_len * 0.7)
-                self.graph_list = self.graph_list[:self.n_samples]
-                print(f"划分训练集: {self.n_samples} 个样本")
-            
+                end_idx = int(original_len * 0.7)
+                self.sample_indices = list(range(0, end_idx))
             case "eval":
-                # 取后10%作为验证集（基于训练集划分）
-                eval_start = int(original_len * 0.7)
-                eval_end = int(original_len * 0.8)
-                self.graph_list = self.graph_list[eval_start:eval_end]
-                self.n_samples = len(self.graph_list)
-                print(f"划分验证集: {self.n_samples} 个样本")
-            
+                start_idx = int(original_len * 0.7)
+                end_idx = int(original_len * 0.8)
+                self.sample_indices = list(range(start_idx, end_idx))
             case "test":
-                test_start = int(original_len * 0.8)
-
-                self.graph_list = self.graph_list[test_start:]
-                self.n_samples = len(self.graph_list)
-                # 测试集使用全部数据（假设test目录下的数据已单独准备）
-                print(f"使用完整测试集: {self.n_samples} 个样本")
-            
+                start_idx = int(original_len * 0.8)
+                self.sample_indices = list(range(start_idx, original_len))
             case "debug":
-                # 调试用小数据集（取前300个）
-                self.n_samples = min(300, original_len)
-                self.graph_list = self.graph_list[:self.n_samples]
-                print(f"划分调试集: {self.n_samples} 个样本")
-            
-            case _:
-                raise ValueError(f"未知的数据集类型: {self.set_name}")
-
-
-    def _move_to_device(self):
-        """将图数据迁移到指定设备（CPU/GPU）"""
-        # 假设图数据是PyTorch Geometric的Data对象或包含tensor的字典
-        # 遍历所有图，将其中的tensor迁移到设备
-        for i in range(self.n_samples):
-            # 如果是PyTorch Geometric的Data对象
-            if hasattr(self.graph_list[i], 'to'):
-                self.graph_list[i] = self.graph_list[i].to(self.device)
-            # 如果是字典（键为'tensor_name'，值为tensor）
-            elif isinstance(self.graph_list[i], dict):
-                for key, value in self.graph_list[i].items():
-                    if isinstance(value, torch.Tensor):
-                        self.graph_list[i][key] = value.to(self.device)
-            else:
-                raise TypeError(f"不支持的数据类型: {type(self.graph_list[i])}")
-        print(f"数据已迁移到设备: {self.device}")
-
-
-    def __getitem__(self, idx):
-        """重写获取样本的方法（返回字典格式，统一接口）"""
-        # 注意：这里的idx是批次索引（继承自BaseDataset的迭代逻辑）
-
-        start = (idx - 1) * self.batch_size
-        end = min(start + self.batch_size, self.n_samples)
-        batch_graphs = self.graph_list[start:end]
-        # batch_ys = [data.y for data in batch_graphs]
-
+                self.sample_indices = list(range(min(300, original_len)))
         
-        batch = Batch.from_data_list(batch_graphs)
+        self.n_samples = len(self.sample_indices)
+        print(f"划分{self.set_name}集: {self.n_samples} 个样本")
+
+    def _preload_frequent_files(self):
+        """预加载最常访问的文件"""
+        # 统计每个文件在当前数据集中的样本数量
+        file_usage = {}
+        for idx in self.sample_indices:
+            file_idx, _ = self.sample_to_file_map[idx]
+            file_usage[file_idx] = file_usage.get(file_idx, 0) + 1
+        
+        # 按使用频率排序
+        sorted_files = sorted(file_usage.items(), key=lambda x: x[1], reverse=True)
+        
+        # 预加载前几个最常用的文件
+        preload_count = min(self.max_files_in_memory, len(sorted_files))
+        print(f"预加载 {preload_count} 个最常用文件...")
+        
+        for i in range(preload_count):
+            file_idx, usage_count = sorted_files[i]
+            self._load_file(file_idx)
+            print(f"  预加载文件 {i+1}/{preload_count}: {os.path.basename(self.file_paths[file_idx])} (使用 {usage_count} 次)")
+
+    def _load_file(self, file_idx: int):
+        """加载指定文件到缓存"""
+        if file_idx in self.file_cache:
+            # 更新访问顺序
+            self.file_cache.move_to_end(file_idx)
+            return self.file_cache[file_idx]
+        
+        # 检查缓存大小，必要时清理
+        while len(self.file_cache) >= self.max_files_in_memory:
+            oldest_file_idx = next(iter(self.file_cache))
+            del self.file_cache[oldest_file_idx]
+            gc.collect()
+        
+        # 加载文件
+        file_path = self.file_paths[file_idx]
+        try:
+            print(f"加载文件: {os.path.basename(file_path)}")
+            data_list = torch.load(file_path, map_location='cpu', weights_only=False)
+            self.file_cache[file_idx] = data_list
+            return data_list
+        except Exception as e:
+            print(f"加载文件失败 {file_path}: {e}")
+            raise
+
+    def __getitem__(self, batch_idx):
+        """获取批次数据"""
+        start = (batch_idx - 1) * self.batch_size
+        end = min(start + self.batch_size, self.n_samples)
+        
+        batch_samples = []
+        
+        # 按文件分组批次中的样本，减少文件加载次数
+        file_samples = {}  # {file_idx: [sample_indices]}
+        
+        for i in range(start, end):
+            global_idx = self.sample_indices[i]
+            file_idx, sample_idx = self.sample_to_file_map[global_idx]
+            
+            if file_idx not in file_samples:
+                file_samples[file_idx] = []
+            file_samples[file_idx].append(sample_idx)
+        
+        # 批量从每个文件获取样本
+        for file_idx, sample_indices in file_samples.items():
+            data_list = self._load_file(file_idx)
+            for sample_idx in sample_indices:
+                batch_samples.append(data_list[sample_idx])
+        
+        # 创建批次
+        batch = Batch.from_data_list(batch_samples)
         
         return {
-                'x': batch.x,
-                'edge_index': batch.edge_index,
-                'batch': batch.batch,
-                'y': batch.y,
-                'solver': batch.solver,
-                'benchmark_path': batch.benchmark_path
-            }
+            'x': batch.x,
+            'edge_index': batch.edge_index,
+            'batch': batch.batch,
+            'y': batch.y,
+            'solver': batch.solver,
+            'benchmark_path': batch.benchmark_path
+        }
 
-    
     def __len__(self):
-        return len(self.graph_list)
-    
-    @staticmethod
-    def collate_fn(batch):
-        from torch_geometric.data import Batch
-        return Batch.from_data_list(batch)
-    
-
-if __name__ == "__main__":
-    cc_bin_dir = "/root/autodl-tmp/project_gnn_original_data/formal_verification_data/CC/bin"
-    device = "cpu"
-
-    CCGraghDataset = SMTGraghDataset(
-        data_dir = cc_bin_dir,
-        set_name = "train",
-        batch_size = 32,
-        drop_last= False,
-        shuffle= True
-    )
-
-    print(CCGraghDataset[2])
-
-
-    print(len(CCGraghDataset))
-
-        
-    
-
-
+        return self.n_samples

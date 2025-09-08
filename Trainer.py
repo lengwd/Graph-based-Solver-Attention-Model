@@ -17,6 +17,7 @@ from Datasets.MultiThreadLoader import MultiThreadLoader
 from Datasets.DatasetUtils import *
 import os
 from sklearn.model_selection import KFold
+import gc
 
 def batch_to_dict(batch):
     """将 PyTorch Geometric 的 Batch 对象转换为字典"""
@@ -77,30 +78,49 @@ class Trainer:
         best_loss = float('inf')
 
         for epoch in range(self.n_epochs):
-            if epoch % 5 == 0:
+            print(f"\n开始第 {epoch+1}/{self.n_epochs} 轮训练")
+            
+            # 每个epoch开始时清理内存
+            if epoch % 2 == 0:
                 torch.cuda.empty_cache()
+                gc.collect()
 
-            loader = MultiThreadLoader(self.train_set, 3)
-            for i, data_dict in enumerate(loader):
-                data_dict = {k: v.to(self.device) if hasattr(v, 'to') else v 
-                    for k, v in data_dict.items()}
-                
-                # 使用 actual_model 调用 trainStep
-                loss_dict, output_dict = self.actual_model.trainStep(data_dict)
+            # 不使用MultiThreadLoader，直接迭代
+            for i in range(1, self.train_set.n_batches + 1):
+                try:
+                    data_dict = self.train_set[i]
+                    
+                    # 移动数据到设备
+                    data_dict = {k: v.to(self.device) if hasattr(v, 'to') else v 
+                        for k, v in data_dict.items()}
+                    
+                    # 训练步骤
+                    loss_dict, output_dict = self.actual_model.trainStep(data_dict)
 
-                for loss_name in self.actual_model.train_loss_names:
-                    ma_losses[loss_name].update(loss_dict[loss_name])
-                    loss_dict[loss_name] = ma_losses[loss_name].get()
+                    # 更新移动平均
+                    for loss_name in self.actual_model.train_loss_names:
+                        ma_losses[loss_name].update(loss_dict[loss_name])
+                        loss_dict[loss_name] = ma_losses[loss_name].get()
 
-                current_lr = self.actual_model.lr
-                pm.update(epoch, i, LR=current_lr, **loss_dict)
+                    current_lr = self.actual_model.lr
+                    pm.update(epoch, i, LR=current_lr, **loss_dict)
+                    
+                    # 定期清理内存
+                    if i % 50 == 0:
+                        torch.cuda.empty_cache()
+                        
+                except Exception as e:
+                    print(f"批次 {i} 训练失败: {e}")
+                    continue
 
             current_lr = self.actual_model.lr
             tm.log(pm.overall_progress, LR=current_lr, **loss_dict)
 
             self.lr_scheduler.update(loss_dict["Train_MSE"])
 
+            # 验证
             if epoch % self.eval_interval == 0:
+                print(f"开始验证...")
                 eval_losses = self.evaluate(self.eval_set)
                 tm.log(pm.overall_progress, **eval_losses)
 
@@ -108,24 +128,38 @@ class Trainer:
                 if eval_loss < best_loss:
                     best_loss = eval_loss
                     self.actual_model.saveTo(os.path.join(self.save_dir, "best.pth"))
+                    print(f"保存最佳模型，验证损失: {eval_loss:.6f}")
+
+            # 清理数据集缓存
+            if hasattr(self.train_set, 'cleanup'):
+                self.train_set.cleanup()
 
         pm.close()
 
     def evaluate(self, dataset: BaseDataset, compute_avg: bool=True):
         n_batches = dataset.n_batches
-        eval_losses = {name: torch.zeros(n_batches).to(DEVICE) for name in self.actual_model.eval_loss_names}
+        eval_losses = {name: [] for name in self.actual_model.eval_loss_names}
         self.model.eval()
 
-        for i, data_dict in enumerate(dataset):
-            # 使用 actual_model 调用 evalStep
-            loss_dict, output_dict = self.actual_model.evalStep(data_dict)
+        with torch.no_grad():
+            for i in range(1, n_batches + 1):
+                try:
+                    data_dict = dataset[i]
+                    data_dict = {k: v.to(self.device) if hasattr(v, 'to') else v 
+                        for k, v in data_dict.items()}
+                    
+                    loss_dict, output_dict = self.actual_model.evalStep(data_dict)
 
-            for name in self.actual_model.eval_loss_names:
-                eval_losses[name][i] = loss_dict[name]
+                    for name in self.actual_model.eval_loss_names:
+                        eval_losses[name].append(loss_dict[name])
+                        
+                except Exception as e:
+                    print(f"评估批次 {i} 失败: {e}")
+                    continue
 
         self.model.train()
 
         if compute_avg:
-            return {name: torch.mean(eval_losses[name]).item() for name in self.actual_model.eval_loss_names}
+            return {name: np.mean(losses) for name, losses in eval_losses.items()}
 
-        return {name: eval_losses[name].cpu().numpy() for name in self.actual_model.eval_loss_names}
+        return {name: np.array(losses) for name, losses in eval_losses.items()}
